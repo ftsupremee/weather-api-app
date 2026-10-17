@@ -1,9 +1,12 @@
-import os
+"""Weather App: PyQt5 front end for weather_client.
+
+The network request runs in a QThread, so the window never freezes while waiting.
+"""
+
 import sys
 
-import requests
 from dotenv import load_dotenv
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QLabel,
@@ -13,130 +16,144 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from weather_client import Weather, WeatherError, fetch_weather, get_api_key
+
+STYLESHEET = """
+    QWidget { font-family: calibri; }
+    QLabel#title_label { font-size: 28px; font-style: italic; }
+    QLineEdit#city_input { font-size: 28px; }
+    QPushButton#search_button { font-size: 24px; font-weight: bold; }
+    QLabel#location_label { font-size: 26px; }
+    QLabel#temperature_label { font-size: 56px; }
+    QLabel#description_label { font-size: 26px; }
+    QLabel#details_label { font-size: 18px; color: #555; }
+    QLabel#status_label { font-size: 18px; color: #b00020; }
+"""
+
+
+class WeatherThread(QThread):
+    """Fetches weather off the UI thread and reports back through signals."""
+
+    succeeded = pyqtSignal(object)  # Weather
+    failed = pyqtSignal(str)
+
+    def __init__(self, city: str, api_key: str, parent=None):
+        super().__init__(parent)
+        self.city = city
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            self.succeeded.emit(fetch_weather(self.city, self.api_key))
+        except WeatherError as error:
+            self.failed.emit(str(error))
+        except Exception:  # never let a worker thread die silently
+            self.failed.emit("Something went wrong. Please try again.")
+
 
 class WeatherApp(QWidget):
-
     def __init__(self):
         super().__init__()
-        self.city_label = QLabel("Enter city name: ", self)
+        self.worker = None
+        self.title_label = QLabel("Enter city name:", self)
         self.city_input = QLineEdit(self)
-        self.get_weather_button = QPushButton("Get weather", self)
+        self.search_button = QPushButton("Get weather", self)
+        self.location_label = QLabel(self)
         self.temperature_label = QLabel(self)
         self.description_label = QLabel(self)
-        self.initUI()
+        self.details_label = QLabel(self)
+        self.status_label = QLabel(self)
+        self.init_ui()
 
-    def initUI(self):
+    def init_ui(self):
         self.setWindowTitle("Weather App")
-        self.setGeometry(400, 400, 300, 350)
-        vbox = QVBoxLayout()
-        
-        vbox.addWidget(self.city_label)
-        vbox.addWidget(self.city_input)
-        vbox.addWidget(self.get_weather_button)
-        vbox.addWidget(self.temperature_label)
-        vbox.addWidget(self.description_label)
+        self.resize(420, 520)
 
-        self.setLayout(vbox)
-        self.city_label.setAlignment(Qt.AlignCenter)
-        self.city_input.setAlignment(Qt.AlignCenter)
-        self.temperature_label.setAlignment(Qt.AlignCenter)
-        self.description_label.setAlignment(Qt.AlignCenter)
+        layout = QVBoxLayout(self)
+        for widget in (
+            self.title_label,
+            self.city_input,
+            self.search_button,
+            self.location_label,
+            self.temperature_label,
+            self.description_label,
+            self.details_label,
+            self.status_label,
+        ):
+            layout.addWidget(widget)
+            if isinstance(widget, (QLabel, QLineEdit)):
+                widget.setAlignment(Qt.AlignCenter)
 
-        self.city_label.setObjectName("city_label")
-        self.city_input.setObjectName("city_input")
-        self.get_weather_button.setObjectName("get_weather_button")
-        self.temperature_label.setObjectName("temperature_label")
-        self.description_label.setObjectName("description_label")
+        for name in (
+            "title_label", "city_input", "search_button", "location_label",
+            "temperature_label", "description_label", "details_label", "status_label",
+        ):
+            getattr(self, name).setObjectName(name)
 
-        self.setStyleSheet("""
-            QLabel, QPushButton{
-                font-family: calibri;
-            }
+        self.status_label.setWordWrap(True)
+        self.setStyleSheet(STYLESHEET)
 
-            QLabel#city_label{
-                font-size: 40px;
-                font-style: italic;
-            }
+        self.search_button.clicked.connect(self.search)
+        self.city_input.returnPressed.connect(self.search)
 
-            QLineEdit#city_input{
-                font-size: 40px;
-            }
-
-            QPushButton#get_weather_button{
-                font-size: 30px;
-                font-weight: bold;
-            }
-
-            QLabel#temperature_label{
-                font-size: 50px;
-            }
-
-            QLabel#description_label{
-                font-size: 30px;
-            }
-        """)
-
-        self.get_weather_button.clicked.connect(self.get_weather)
-
-    def get_weather(self):
-        city = self.city_input.text()
-        url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}"
-
+    # --- actions -----------------------------------------------------------
+    def search(self):
+        if self.worker is not None and self.worker.isRunning():
+            return
         try:
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
-            if data["cod"] == 200:
-                self.display_weather(data)
+            api_key = get_api_key()
+        except WeatherError as error:
+            self.show_error(str(error))
+            return
 
-        except requests.exceptions.HTTPError:
-            match response.status_code:
-                case 400:
-                    self.display_error("Bad request:\nPlease check your input")
-                case 401:
-                    self.display_error("Unauthorized:\nInvalid API Key")
-                case 403:
-                    self.display_error("Forbidden:\nAccess Denied")
-                case 404:
-                    self.display_error("Not Found:\nCity Not Fouund")
-                case 500:
-                    self.display_error("Internal Server Error:\nPlease try again alter")
-                case 502:
-                    self.display_error("Bad gateway:\nInvalid response from the server")
-                case 503:
-                    self.display_error("Service Unavailable:\nPServer is down")
-                case 504:
-                    self.display_error("Gateway Timeout:\nNo response from the server")
-                case _:
-                    self.display_error("HTTP error")
+        self.search_button.setEnabled(False)
+        self.clear_results()
+        self.status_label.setStyleSheet("color: #555;")
+        self.status_label.setText("Loading...")
 
-        except requests.exceptions.ConnectionError:
-            self.display_error("Connection Error:\nCheck your internet connection")
-        except requests.exceptions.TooManyRedirects:
-            self.display_error("Too many Redirects:\nChecl the URL")
-        except requests.exceptions.Timeout:
-            self.display_error("Timeout Error:\nThe request timed out")
-        except requests.exceptions.RequestException as req_error:
-            self.display_error(f"Request Error:\n{req_error}")
+        self.worker = WeatherThread(self.city_input.text(), api_key, self)
+        self.worker.succeeded.connect(self.show_weather)
+        self.worker.failed.connect(self.show_error)
+        self.worker.finished.connect(self.on_finished)
+        self.worker.start()
 
-    def display_error(self, message):
-        self.temperature_label.setStyleSheet("font-size: 20px")
-        self.temperature_label.setText(message)
-        self.description_label.clear()
+    def on_finished(self):
+        self.search_button.setEnabled(True)
 
-    def display_weather(self, data):
-        temperature_k = data["main"]["temp"]
-        temperature_c = temperature_k - 273.15
-        self.temperature_label.setStyleSheet("font-size: 50px")
-        self.temperature_label.setText(F"{temperature_c:.0f}°C")
+    def clear_results(self):
+        for label in (
+            self.location_label, self.temperature_label, self.description_label,
+            self.details_label, self.status_label,
+        ):
+            label.clear()
 
-        weather_description = data["weather"][0]["description"].capitalize()
-        self.description_label.setText(weather_description)
+    def show_error(self, message: str):
+        self.clear_results()
+        self.status_label.setStyleSheet("")  # fall back to the red from the stylesheet
+        self.status_label.setText(message)
 
-if __name__ == '__main__':
+    def show_weather(self, weather: Weather):
+        self.clear_results()
+        self.location_label.setText(f"{weather.city}, {weather.country}")
+        self.temperature_label.setText(f"{weather.temperature_c:.0f}°C")
+        self.description_label.setText(weather.description)
+        self.details_label.setText(
+            f"Humidity {weather.humidity}%  ·  Wind {weather.wind_speed_ms:.1f} m/s"
+        )
+
+    def closeEvent(self, event):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.wait(2000)  # requests has a 10 s timeout; don't hang the exit on it
+        super().closeEvent(event)
+
+
+def main():
     load_dotenv()
-    api_key = os.getenv("api_key")
-    app =  QApplication(sys.argv)
-    weather_app = WeatherApp()
-    weather_app.show()
+    app = QApplication(sys.argv)
+    window = WeatherApp()
+    window.show()
     sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
